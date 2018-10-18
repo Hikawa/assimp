@@ -63,7 +63,7 @@ static const aiImporterDesc desc = {"MMD Importer",
                                     0,
                                     0,
                                     0,
-                                    "pmx"};
+                                    "pmx pmd"};
 
 namespace Assimp {
 
@@ -90,11 +90,11 @@ bool MMDImporter::CanRead(const std::string &pFile, IOSystem *pIOHandler,
                           bool checkSig) const {
   if (!checkSig) // Check File Extension
   {
-    return SimpleExtensionCheck(pFile, "pmx");
+    return SimpleExtensionCheck(pFile, "pmx") || SimpleExtensionCheck(pFile, "pmd");
   } else // Check file Header
   {
-    static const char *pTokens[] = {"PMX "};
-    return BaseImporter::SearchFileHeaderForToken(pIOHandler, pFile, pTokens, 1);
+    static const char *pTokens[] = {"PMX ", "Pmd"};
+    return BaseImporter::SearchFileHeaderForToken(pIOHandler, pFile, pTokens, 2);
   }
 }
 
@@ -111,21 +111,26 @@ void MMDImporter::InternReadFile(const std::string &file, aiScene *pScene,
     throw DeadlyImportError("Failed to open file " + file + ".");
   }
 
-  std::istream fileStream(&fb);
+  if (SimpleExtensionCheck(file, "pmx")) {
+    std::istream fileStream(&fb);
 
-  // Get the file-size and validate it, throwing an exception when fails
-  fileStream.seekg(0, fileStream.end);
-  size_t fileSize = static_cast<size_t>(fileStream.tellg());
-  fileStream.seekg(0, fileStream.beg);
+    // Get the file-size and validate it, throwing an exception when fails
+    fileStream.seekg(0, fileStream.end);
+    size_t fileSize = static_cast<size_t>(fileStream.tellg());
+    fileStream.seekg(0, fileStream.beg);
 
-  if (fileSize < sizeof(pmx::PmxModel)) {
-    throw DeadlyImportError(file + " is too small.");
+    if (fileSize < sizeof(pmx::PmxModel)) {
+      throw DeadlyImportError(file + " is too small.");
+    }
+
+    pmx::PmxModel model;
+    model.Read(&fileStream);
+
+    CreateDataFromImport(&model, pScene);
+  } else {
+    std::unique_ptr<pmd::PmdModel> model = pmd::PmdModel::LoadFromFile(file.c_str());
+    CreateDataFromImport(model.get(), pScene);
   }
-
-  pmx::PmxModel model;
-  model.Read(&fileStream);
-
-  CreateDataFromImport(&model, pScene);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -188,6 +193,81 @@ void MMDImporter::CreateDataFromImport(const pmx::PmxModel *pModel,
 
   // create materials
   pScene->mNumMaterials = pModel->material_count;
+  pScene->mMaterials = new aiMaterial *[pScene->mNumMaterials];
+  for (unsigned int i = 0; i < pScene->mNumMaterials; i++) {
+    pScene->mMaterials[i] = CreateMaterial(&pModel->materials[i], pModel);
+  }
+
+  // Convert everything to OpenGL space
+  MakeLeftHandedProcess convertProcess;
+  convertProcess.Execute(pScene);
+
+  FlipUVsProcess uvFlipper;
+  uvFlipper.Execute(pScene);
+
+  FlipWindingOrderProcess windingFlipper;
+  windingFlipper.Execute(pScene);
+}
+
+void MMDImporter::CreateDataFromImport(const pmd::PmdModel *pModel,
+                                       aiScene *pScene) {
+  if (pModel == NULL) {
+    return;
+  }
+
+  aiNode *pNode = new aiNode;
+  if (!pModel->header.name.empty()) {
+    pNode->mName.Set(pModel->header.name);
+  }
+
+  pScene->mRootNode = pNode;
+
+  pNode = new aiNode;
+  pScene->mRootNode->addChildren(1, &pNode);
+  pNode->mName.Set(string(pModel->header.name) + string("_mesh"));
+
+  // split mesh by materials
+  pNode->mNumMeshes = pModel->materials.size();
+  pNode->mMeshes = new unsigned int[pNode->mNumMeshes];
+  for (unsigned int index = 0; index < pNode->mNumMeshes; index++) {
+    pNode->mMeshes[index] = index;
+  }
+
+  pScene->mNumMeshes = pModel->materials.size();
+  pScene->mMeshes = new aiMesh *[pScene->mNumMeshes];
+  for (unsigned int i = 0, indexStart = 0; i < pScene->mNumMeshes; i++) {
+    const int indexCount = pModel->materials[i].index_count;
+
+    pScene->mMeshes[i] = CreateMesh(pModel, indexStart, indexCount);
+    pScene->mMeshes[i]->mName = pModel->materials[i].texture_filename;
+    pScene->mMeshes[i]->mMaterialIndex = i;
+    indexStart += indexCount;
+  }
+
+  // create node hierarchy for bone position
+  std::unique_ptr<aiNode *[]> ppNode(new aiNode *[pModel->bones.size()]);
+  for (auto i = 0; i < pModel->bones.size(); i++) {
+    ppNode[i] = new aiNode(pModel->bones[i].name);
+  }
+
+  for (auto i = 0; i < pModel->bones.size(); i++) {
+    const pmd::PmdBone &bone = pModel->bones[i];
+
+    if (bone.parent_bone_index == 0xFFFF) {
+      pScene->mRootNode->addChildren(1, ppNode.get() + i);
+    } else {
+      ppNode[bone.parent_bone_index]->addChildren(1, ppNode.get() + i);
+
+      aiVector3D v3 = aiVector3D(
+          bone.bone_head_pos[0] - pModel->bones[bone.parent_bone_index].bone_head_pos[0],
+          bone.bone_head_pos[1] - pModel->bones[bone.parent_bone_index].bone_head_pos[1],
+          bone.bone_head_pos[2] - pModel->bones[bone.parent_bone_index].bone_head_pos[2]);
+      aiMatrix4x4::Translation(v3, ppNode[i]->mTransformation);
+    }
+  }
+
+  // create materials
+  pScene->mNumMaterials = pModel->materials.size();
   pScene->mMaterials = new aiMaterial *[pScene->mNumMaterials];
   for (unsigned int i = 0; i < pScene->mNumMaterials; i++) {
     pScene->mMaterials[i] = CreateMaterial(&pModel->materials[i], pModel);
@@ -332,6 +412,71 @@ aiMesh *MMDImporter::CreateMesh(const pmx::PmxModel *pModel,
   return pMesh;
 }
 
+aiMesh *MMDImporter::CreateMesh(const pmd::PmdModel *pModel,
+                                const int indexStart, const int indexCount) {
+  aiMesh *pMesh = new aiMesh;
+
+  pMesh->mNumVertices = indexCount;
+
+  pMesh->mNumFaces = indexCount / 3;
+  pMesh->mFaces = new aiFace[pMesh->mNumFaces];
+
+  const int numIndices = 3; // triangular face
+  for (unsigned int index = 0; index < pMesh->mNumFaces; index++) {
+    pMesh->mFaces[index].mNumIndices = numIndices;
+    unsigned int *indices = new unsigned int[numIndices];
+    indices[0] = numIndices * index;
+    indices[1] = numIndices * index + 1;
+    indices[2] = numIndices * index + 2;
+    pMesh->mFaces[index].mIndices = indices;
+  }
+
+  pMesh->mVertices = new aiVector3D[pMesh->mNumVertices];
+  pMesh->mNormals = new aiVector3D[pMesh->mNumVertices];
+  pMesh->mTextureCoords[0] = new aiVector3D[pMesh->mNumVertices];
+  pMesh->mNumUVComponents[0] = 2;
+
+  // map<int, vector<aiVertexWeight>> bone_vertex_map;
+
+  // fill in contents and create bones
+  for (int index = 0; index < indexCount; index++) {
+    const pmd::PmdVertex *v =
+        &pModel->vertices[pModel->indices[indexStart + index]];
+    const float *position = v->position;
+    pMesh->mVertices[index].Set(position[0], position[1], position[2]);
+    const float *normal = v->normal;
+
+    pMesh->mNormals[index].Set(normal[0], normal[1], normal[2]);
+    pMesh->mTextureCoords[0][index].x = v->uv[0];
+    pMesh->mTextureCoords[0][index].y = v->uv[1];
+  }
+
+  // make all bones for each mesh
+  // assign bone weights to skinned bones (otherwise just initialize)
+  auto bone_ptr_ptr = new aiBone *[pModel->bones.size()];
+  pMesh->mNumBones = pModel->bones.size();
+  pMesh->mBones = bone_ptr_ptr;
+  for (auto ii = 0; ii < pModel->bones.size(); ++ii) {
+    auto pBone = new aiBone;
+    const auto &pmxBone = pModel->bones[ii];
+    pBone->mName = pmxBone.name;
+    aiVector3D pos(pmxBone.bone_head_pos[0], pmxBone.bone_head_pos[1], pmxBone.bone_head_pos[2]);
+    aiMatrix4x4::Translation(-pos, pBone->mOffsetMatrix);
+    /*
+    auto it = bone_vertex_map.find(ii);
+    if (it != bone_vertex_map.end()) {
+      pBone->mNumWeights = static_cast<unsigned int>(it->second.size());
+      pBone->mWeights = new aiVertexWeight[pBone->mNumWeights];
+      for (unsigned int j = 0; j < pBone->mNumWeights; j++) {
+          pBone->mWeights[j] = it->second[j];
+      }
+    }*/
+    bone_ptr_ptr[ii] = pBone;
+  }
+
+  return pMesh;
+}
+
 // ------------------------------------------------------------------------------------------------
 aiMaterial *MMDImporter::CreateMaterial(const pmx::PmxMaterial *pMat,
                                         const pmx::PmxModel *pModel) {
@@ -353,6 +498,34 @@ aiMaterial *MMDImporter::CreateMaterial(const pmx::PmxMaterial *pMat,
 
   if(pMat->diffuse_texture_index >= 0) {
       aiString texture_path(pModel->textures[pMat->diffuse_texture_index]);
+      mat->AddProperty(&texture_path, AI_MATKEY_TEXTURE(aiTextureType_DIFFUSE, 0));
+  }
+
+  int mapping_uvwsrc = 0;
+  mat->AddProperty(&mapping_uvwsrc, 1,
+                   AI_MATKEY_UVWSRC(aiTextureType_DIFFUSE, 0));
+
+  return mat;
+}
+
+aiMaterial *MMDImporter::CreateMaterial(const pmd::PmdMaterial *pMat,
+                                        const pmd::PmdModel *pModel) {
+  aiMaterial *mat = new aiMaterial();
+
+  aiColor3D diffuse(pMat->diffuse[0], pMat->diffuse[1], pMat->diffuse[2]);
+  mat->AddProperty(&diffuse, 1, AI_MATKEY_COLOR_DIFFUSE);
+  aiColor3D specular(pMat->specular[0], pMat->specular[1], pMat->specular[2]);
+  mat->AddProperty(&specular, 1, AI_MATKEY_COLOR_SPECULAR);
+  aiColor3D ambient(pMat->ambient[0], pMat->ambient[1], pMat->ambient[2]);
+  mat->AddProperty(&ambient, 1, AI_MATKEY_COLOR_AMBIENT);
+
+  float opacity = pMat->diffuse[3];
+  mat->AddProperty(&opacity, 1, AI_MATKEY_OPACITY);
+  float shininess = pMat->power;
+  mat->AddProperty(&shininess, 1, AI_MATKEY_SHININESS_STRENGTH);
+
+  if(!pMat->texture_filename.empty()) {
+      aiString texture_path(pMat->texture_filename);
       mat->AddProperty(&texture_path, AI_MATKEY_TEXTURE(aiTextureType_DIFFUSE, 0));
   }
 

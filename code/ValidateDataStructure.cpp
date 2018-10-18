@@ -517,7 +517,7 @@ void ValidateDSProcess::Validate( const aiMesh* pMesh,
     this->Validate(&pBone->mName);
 
     if (!pBone->mNumWeights)    {
-        ReportError("aiBone::mNumWeights is zero");
+        // ReportError("aiBone::mNumWeights is zero");
     }
 
     // check whether all vertices affected by this bone are valid
